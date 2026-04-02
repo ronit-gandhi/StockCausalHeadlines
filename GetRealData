@@ -1,0 +1,119 @@
+# get_real_data.R
+# ---------------------------------
+library(tidyverse)
+library(quantmod)   # for tq_get
+library(tidytext)   # for unnest_tokens, get_sentiments
+library(httr)       # for GET
+library(jsonlite)   # for fromJSON
+library(lubridate)  # for date handling
+
+# ---- 0. Your NewsAPI key ----
+NEWSAPI_KEY <- "PRIVATE"
+
+# ---- 1. Download stock data + compute next-day return ----
+get_stock_data <- function(ticker = "TSLA",
+                           from   = "2022-01-01",
+                           to     = Sys.Date()) {
+  tq_get(ticker, from = from, to = to) %>%
+    select(date, adjusted) %>%
+    arrange(date) %>%
+    mutate(return_tomorrow = lead(log(adjusted) - log(lag(adjusted))))
+}
+get_headlines <- function(company = "TSLA",
+                          from_date = Sys.Date() - 29,
+                          to_date = Sys.Date()) {
+  # NewsAPI free plan only allows 30 days of history
+  earliest_allowed <- Sys.Date() - 30
+  if (from_date < earliest_allowed) {
+    warning("⚠️ Adjusting 'from_date' to comply with NewsAPI free plan (max 30 days back).")
+    from_date <- earliest_allowed
+  }
+  
+  all_headlines <- map_dfr(seq(from_date, to_date, by = "days"), function(single_date) {
+    res <- httr::GET(
+      "https://newsapi.org/v2/everything",
+      httr::add_headers(
+        `X-Api-Key` = NEWSAPI_KEY,
+        `User-Agent` = "R (httr)",
+        Accept = "application/json"
+      ),
+      query = list(
+        q = company,
+        from = as.character(single_date),
+        to = as.character(single_date),
+        sortBy = "publishedAt",
+        pageSize = 100,
+        language = "en"
+      )
+    )
+    
+    if (httr::status_code(res) != 200) {
+      message("⚠️ Failed for ", single_date, " — skipping")
+      return(tibble(date = as.Date(character()), headline = character()))
+    }
+    
+    json <- httr::content(res, as = "text", encoding = "UTF-8")
+    parsed <- jsonlite::fromJSON(json, flatten = TRUE)
+    
+    if (length(parsed$articles) == 0) {
+      return(tibble(date = as.Date(single_date), headline = NA_character_))
+    }
+    
+    tibble(
+      date = as.Date(substr(parsed$articles$publishedAt, 1, 10)),
+      headline = parsed$articles$title
+    ) %>% filter(!is.na(headline))
+  })
+  
+  return(all_headlines)
+}
+# ---- 4. Merge stock + sentiment into one clean dataset ----
+get_combined_data <- function() {
+  today <- Sys.Date()
+  stock_data <- get_stock_data(to = today)
+  
+  # Try to get headlines, skip if any API error
+  headlines <- tryCatch({
+    get_headlines(to_date = today)
+  }, error = function(e) {
+    message("⚠️ Could not fetch headlines: ", conditionMessage(e))
+    return(NULL)
+  })
+  
+  if (is.null(headlines) || nrow(headlines) == 0 || all(is.na(headlines$headline))) {
+    message("⚠️ No headline data available — continuing with stock data only.")
+    data_final <- stock_data
+  } else {
+    sentiment_scores <- score_sentiment(headlines)
+    data_final <- inner_join(stock_data, sentiment_scores, by = "date")
+  }
+  
+  dir.create("data", showWarnings = FALSE)
+  write_csv(data_final, "/Users/ronitgandhi/Downloads/real_sentiment_stock_data.csv")
+  message("✅ Saved data to /Users/ronitgandhi/Downloads/real_sentiment_stock_data.csv")
+  return(data_final)
+}
+# ---- 5. Run it when sourcing interactively ----
+data_final <- get_combined_data()
+
+
+
+
+
+
+test_res <- httr::GET(
+  "https://newsapi.org/v2/everything",
+  httr::add_headers(
+    `X-Api-Key` = NEWSAPI_KEY,
+    `User-Agent` = "R (httr)"
+  ),
+  query = list(
+    q = "TSLA",
+    from = Sys.Date() - 1,
+    to   = Sys.Date(),
+    pageSize = 1
+  )
+)
+
+httr::status_code(test_res)
+httr::content(test_res, as = "text", encoding = "UTF-8")
