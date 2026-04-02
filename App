@@ -1,0 +1,205 @@
+# app.R ---------------------------------------------------------------
+
+library(shiny)
+library(tidyverse)
+library(plotly)
+library(DT)
+library(grf)
+library(zoo)
+
+# Load and prepare data -----------------------------------------------
+# Load CSV
+data_raw <- read_csv(
+  "/Users/ronitgandhi/Downloads/real_sentiment_stock_data.csv",
+  col_types = cols(date = col_date(format = "%Y-%m-%d"))
+) |>
+  arrange(date)
+
+# Conditionally add sentiment_score
+if (!"sentiment_score" %in% names(data_raw)) {
+  if (all(c("positive", "negative") %in% names(data_raw))) {
+    data_raw <- data_raw |>
+      mutate(sentiment_score = positive - negative)
+  } else {
+    data_raw$sentiment_score <- NA_real_
+  }
+}
+
+# Conditionally add treatment
+if (!"treatment" %in% names(data_raw)) {
+  if ("sentiment_score" %in% names(data_raw)) {
+    data_raw <- data_raw |>
+      mutate(treatment = as.integer(sentiment_score > 0))
+  } else {
+    data_raw$treatment <- NA_integer_
+  }
+}
+
+# Add lag/volatility and clean
+data <- data_raw |>
+  mutate(
+    lag_return = lag(return_tomorrow),
+    volatility = rollapply(return_tomorrow, 5, sd, fill = NA, align = "right")
+  ) |>
+  filter(
+    !is.na(lag_return),
+    !is.na(volatility)
+  )
+# UI ------------------------------------------------------------------
+
+ui <- fluidPage(
+  titlePanel("📈 Causal Impact of News Sentiment on Stock Returns"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      dateRangeInput(
+        "range", "Date Range:",
+        start = min(data$date),
+        end = max(data$date),
+        min = min(data$date),
+        max = max(data$date)
+      ),
+      checkboxInput("show_table", "Show Data Table", value = FALSE)
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel(
+          "Exploration",
+          plotlyOutput("sentiment_plot"),
+          plotlyOutput("return_plot")
+        ),
+        tabPanel(
+          "Causal Inference",
+          verbatimTextOutput("ipw_text"),
+          verbatimTextOutput("cf_text")
+        ),
+        tabPanel(
+          "Data",
+          DTOutput("table")
+        )
+      )
+    )
+  )
+)
+
+# Server logic --------------------------------------------------------
+
+server <- function(input, output) {
+  fd <- reactive({
+    data |>
+      filter(
+        date >= input$range[1],
+        date <= input$range[2]
+      )
+  })
+  
+  output$sentiment_plot <- renderPlotly({
+    if (!"sentiment_score" %in% names(data)) return(NULL)
+    
+    p <- ggplot(fd(), aes(date, sentiment_score)) +
+      geom_line(color = "darkgreen", na.rm = TRUE) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+      labs(
+        title = "Daily News Sentiment Score",
+        y = "Sentiment Score",
+        x = ""
+      ) +
+      theme_minimal()
+    
+    ggplotly(p)
+  })
+  
+  output$return_plot <- renderPlotly({
+    p <- ggplot(fd(), aes(date, return_tomorrow)) +
+      geom_line(color = "blue", na.rm = TRUE) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+      labs(
+        title = "Next-Day Log Return",
+        y = "Log Return",
+        x = ""
+      ) +
+      theme_minimal()
+    
+    ggplotly(p)
+  })
+  
+  output$ipw_text <- renderPrint({
+    dat <- fd()
+    
+    if (!all(c("sentiment_score", "treatment") %in% names(dat))) {
+      cat("IPW unavailable: missing sentiment_score or treatment.\n")
+      return()
+    }
+    
+    if (nrow(dat) < 2 || length(unique(na.omit(dat$treatment))) < 2) {
+      cat("Not enough variation for IPW estimation.\n")
+      return()
+    }
+    
+    ps_mod <- glm(
+      treatment ~ lag_return + volatility,
+      family = binomial,
+      data = dat
+    )
+    
+    dat$pscore <- predict(ps_mod, type = "response")
+    
+    dat$wt <- ifelse(
+      dat$treatment == 1,
+      1 / dat$pscore,
+      1 / (1 - dat$pscore)
+    )
+    
+    ate_ipw <- with(
+      dat,
+      weighted.mean(return_tomorrow[treatment == 1], wt[treatment == 1]) -
+        weighted.mean(return_tomorrow[treatment == 0], wt[treatment == 0])
+    )
+    
+    cat("📊 IPW Estimate of ATE:\n")
+    cat(sprintf("  ATE = %.5f\n", ate_ipw))
+    cat(sprintf(
+      "Interpretation: Positive sentiment days impact next-day return by %.2f%%.\n",
+      ate_ipw * 100
+    ))
+  })
+  
+  output$cf_text <- renderPrint({
+    dat <- fd()
+    
+    if (!all(c("treatment", "lag_return", "volatility") %in% names(dat))) {
+      cat("Causal Forest unavailable: missing required columns.\n")
+      return()
+    }
+    
+    if (nrow(dat) < 50 || length(unique(na.omit(dat$treatment))) < 2) {
+      cat("Not enough data for Causal Forest.\n")
+      return()
+    }
+    
+    X <- as.matrix(dat |>
+                     select(lag_return, volatility))
+    
+    W <- dat$treatment
+    Y <- dat$return_tomorrow
+    
+    cf <- causal_forest(X, Y, W)
+    ate <- average_treatment_effect(cf)
+    
+    cat("🌳 Causal Forest ATE:\n")
+    cat(sprintf("  ATE = %.5f (SE = %.5f)\n", ate[1], ate[2]))
+    cat(sprintf(
+      "Interpretation: Positive sentiment days increase next-day return by %.2f%% (±%.2f%%).\n",
+      ate[1] * 100, ate[2] * 100
+    ))
+  })
+  
+  output$table <- renderDT({
+    datatable(fd(), options = list(pageLength = 10))
+  })
+}
+
+# Run the app ---------------------------------------------------------
+
+shinyApp(ui, server)
